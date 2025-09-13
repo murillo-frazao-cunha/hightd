@@ -7,6 +7,7 @@ import Server from "./libs/Server"
 import config from "./config.json";
 import websocket from '@fastify/websocket';
 import {hasPermission} from './libs/RemoteConnect';
+import { startSFTP } from './libs/SFTP';
 
 async function main() {
     const orm = new SuperORM('database.sqlite');
@@ -226,6 +227,7 @@ async function main() {
 
     try {
         await fastify.listen({ port: config.port })
+        startSFTP(config.sftp);
         await Server.start()
     } catch (err) {
         fastify.log.error(err)

@@ -9,7 +9,7 @@ const PREFIX_LABEL = 'container@hightd ~';
 // --- Classe Principal de Gerenciamento do Servidor ---
 const docker = new Docker();
 const CONTAINER_NAME_PREFIX = 'ptero-clone-';
-const BASE_SERVER_PATH = 'E:/servers';
+export const BASE_SERVER_PATH = 'E:/servers';
 
 export default class Server {
 

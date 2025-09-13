@@ -6,6 +6,21 @@ const API_BASE_URL = config.remote + '/api/nodes/helper';
 const api = axios.create({ baseURL: API_BASE_URL });
 
 
+export async function VerifySFTP(userName: string, password: string, server: Server) {
+    try {
+        const response = await api.post('/verify-sftp', {
+            userName: userName,
+            password: password,
+            serverUuid: server.id,
+            token: config.token
+        })
+        return response.data.permission as boolean;
+    } catch (e) {
+        console.error('Error verifying SFTP:', e);
+        return false;
+    }
+}
+
 export async function userIsAdmin(userUuid: string) {
     try {
         const response = await api.post('/admin-permission', {

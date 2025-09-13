@@ -20,12 +20,14 @@
     "fastify": "^5.6.0",
     "ioredis": "^5.7.0",
     "reflect-metadata": "^0.2.2",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "ssh2": "^1.15.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/dockerode": "^3.3.43",
     "@types/node": "^24.3.1",
+    "@types/ssh2": "^1.11.15",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2"
