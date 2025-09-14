@@ -3,13 +3,34 @@ import Docker from 'dockerode';
 import { CoreData, AllocationData, StartData, StopData } from "../types/ServerTypes";
 import fs from 'fs/promises'; // Adicionado para manipulação de arquivos
 import { PassThrough } from 'stream';
+import path from 'path';
 
-const PREFIX_LABEL = 'container@hightd ~';
-
+// --- Helper to calculate directory size ---
+async function getDirectorySize(dir: string): Promise<number> {
+    try {
+        const files = await fs.readdir(dir, { withFileTypes: true });
+        const sizes = await Promise.all(files.map(async file => {
+            const filePath = path.join(dir, file.name);
+            if (file.isDirectory()) {
+                return getDirectorySize(filePath);
+            }
+            try {
+                const { size } = await fs.stat(filePath);
+                return size;
+            } catch {
+                return 0; // Ignore files we can't stat
+            }
+        }));
+        return sizes.reduce((acc, size) => acc + size, 0);
+    } catch {
+        return 0; // If we can't read the directory, size is 0
+    }
+}
 // --- Classe Principal de Gerenciamento do Servidor ---
 const docker = new Docker();
 const CONTAINER_NAME_PREFIX = 'ptero-clone-';
-export const BASE_SERVER_PATH = 'E:/servers';
+import config from "../config.json"
+export const BASE_SERVER_PATH = config.path;
 
 export default class Server {
 
@@ -51,32 +72,85 @@ export default class Server {
      * Envia comando (fila até attach estar pronto). Aceita string ou {command}.
      */
     async sendCommand(input: string | { command: string }): Promise<void> {
-        const cmd = typeof input === 'string' ? input : input?.command;
-        if (!cmd || typeof cmd !== 'string') throw new Error('Comando inválido');
-        if (!this.container) throw new Error('Container inexistente');
-        if (!this.stdinStream) {
-            console.log(`[Server:${this.id}] STDIN ausente, tentando reattach antes de enviar comando...`);
-            await this._reattach();
-        }
-        if (!this.stdinStream) throw new Error('STDIN indisponível');
-        const line = cmd.endsWith('\n') ? cmd : cmd + '\n';
-        try {
-            this.stdinStream.write(line);
-            console.log(`[Server:${this.id}] Comando enviado: ${cmd}`);
-        } catch (e) {
-            throw new Error('Falha ao escrever no STDIN: ' + (e as any)?.message);
-        }
+        if (!this.container) return;
+        this.container.attach({
+            stream: true,
+            stdin: true,
+            stdout: true,
+            stderr: true
+        }, function handler(err, stream) {
+            if(err || !stream) {
+                console.error(err);
+                return;
+            }
+
+            // O write deve ser feito em um ponto que garanta a conexão
+            // completa, como após um evento 'ready' ou 'connect'.
+            // Algumas bibliotecas de cliente para Docker já fazem isso
+            // implicitamente, mas o ideal é que você se certifique.
+
+            // A forma mais direta é chamar o write logo após,
+            // mas se o problema persistir, a causa é assíncrona.
+
+            // A maneira correta seria:
+            // 1. Você precisa garantir que a stream é a de input (stdin).
+            // 2. Você tem que se certificar de que ela está pronta para receber dados.
+
+            // Exemplo de como poderia ser:
+            // Se a stream é um HttpDuplex, ela é tanto lida quanto escrita
+            stream.on('connect', () => {
+                stream.write(`${input}\n`, (writeErr) => {
+                    if (writeErr) {
+                        console.error("Erro ao escrever na stream:", writeErr);
+                    } else {
+                        console.log("Comando enviado com sucesso 1.");
+                    }
+                });
+            });
+
+            // Se o seu stream não tiver o evento 'connect', a solução
+            // mais simples pode ser adicionar um pequeno delay com 'setTimeout'.
+            // Mas, essa é uma solução temporária, não a ideal.
+            // O ideal é a solução baseada em eventos acima.
+
+            // Exemplo do seu código, ajustado (se o problema for o tempo):
+            stream.write(`${input}\n`, (err) => {
+                if (err) {
+                    console.error("Erro ao escrever na stream:", err);
+                } else {
+                    console.log("Comando enviado com sucesso 2.");
+                }
+            });
+        });
     }
 
     /**
-     * Puxa as estatísticas de uso de CPU e RAM do container.
+     * Puxa as estatísticas de uso de CPU, RAM, disco e rede do container.
      */
-    async getUsages(): Promise<{ cpu: number; memory: number; memoryLimit: number }> {
+    async getUsages(): Promise<{ cpu: number; memory: number; memoryLimit: number; disk: number; networkIn: number; networkOut: number; }> {
+        const serverPath = `${BASE_SERVER_PATH}/${this.id}`;
+        const diskUsagePromise = getDirectorySize(serverPath);
+
         if (await this.getStatus() === 'stopped' || !this.container) {
-            return { cpu: 0, memory: 0, memoryLimit: 0 };
+            const disk = await diskUsagePromise;
+            return { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
         }
+
         try {
-            const stats = await this.container.stats({ stream: false });
+            const [stats, disk] = await Promise.all([
+                this.container.stats({ stream: false }),
+                diskUsagePromise
+            ]);
+
+            let networkIn = 0;
+            let networkOut = 0;
+            if (stats.networks) {
+                for (const net of Object.values(stats.networks)) {
+                    networkIn += net.rx_bytes || 0;
+                    networkOut += net.tx_bytes || 0;
+                }
+            }
+
             const memoryUsage = stats.memory_stats?.usage || 0;
             const memoryLimit = stats.memory_stats?.limit || 0;
             const previousCpu = stats.precpu_stats?.cpu_usage?.total_usage || 0;
@@ -89,11 +163,69 @@ export default class Server {
                 cpuUsage = (cpuDelta / systemCpuDelta) * numberOfCpus * 100.0;
             }
             const cpu = parseFloat(cpuUsage.toFixed(2));
-            const memory = memoryUsage; // bytes
-            const memoryLimitOut = memoryLimit; // bytes
-            return { cpu, memory, memoryLimit: memoryLimitOut };
+
+            return {
+                cpu,
+                memory: memoryUsage,
+                memoryLimit: memoryLimit,
+                disk,
+                networkIn,
+                networkOut,
+            };
         } catch (e) {
-            return { cpu: 0, memory: 0, memoryLimit: 0 };
+            const disk = await diskUsagePromise.catch(() => 0);
+            return { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
+        }
+    }
+
+    private async ensureWritable(dir: string) {
+        try {
+            const uid = 65534;
+            const gid = 65534;
+
+            // Aplica recursivamente
+            const applyPermissions = async (p: string) => {
+                const stats = await fs.stat(p);
+
+                if (stats.isDirectory()) {
+                    await fs.chmod(p, 0o755).catch(()=>{});
+                    await fs.chown(p, uid, gid).catch(()=>{});
+
+                    const entries = await fs.readdir(p).catch(()=>[] as string[]);
+                    for (const name of entries) {
+                        await applyPermissions(path.join(p, name));
+                    }
+                } else {
+                    await fs.chmod(p, 0o644).catch(()=>{});
+                    await fs.chown(p, uid, gid).catch(()=>{});
+                }
+            };
+
+            await applyPermissions(dir);
+        } catch (e) {
+            this._emitLive('warn', 'Não foi possível ajustar permissões: ' + (e as any)?.message);
+        }
+    }
+
+    /**
+     * Executa um container temporário como root para ajustar permissões do diretório montado.
+     */
+    private async fixPerms(image: string, hostDir: string) {
+        try {
+            const cmd = 'chmod -R a+rwX /etc/enderd; chown -R 65534:65534 /etc/enderd';
+            const helper = await docker.createContainer({
+                Image: image,
+                Cmd: ['/bin/sh', '-c', cmd],
+                HostConfig: {
+                    Binds: [`${hostDir}:/etc/enderd`],
+                    ReadonlyRootfs: false,
+                    AutoRemove: true
+                }
+            });
+            await helper.start();
+            await helper.wait().catch(()=>{});
+        } catch (e) {
+            this._emitLive('warn', 'fixPerms falhou (continuando assim mesmo): ' + (e as any)?.message);
         }
     }
 
@@ -127,13 +259,10 @@ export default class Server {
         let startupBase = data.core.startupCommand ? replaceVars(data.core.startupCommand) : '';
         startupBase = startupBase.replace('{{SERVER_MEMORY}}', String(data.memory));
 
-        const needsExec = !/^\s*exec\b/.test(startupBase);
-        const finalStartupCommand = needsExec ? `exec ${startupBase}` : startupBase;
         const combinedCommand = installScript && installScript.trim() !== ''
-            ? `${installScript}\n${finalStartupCommand}`
-            : finalStartupCommand;
+            ? `${installScript}\n${startupBase}`
+            : startupBase;
 
-        // --- Geração de arquivos de config / templates ---
         const templates: Record<string, any> = {};
         if((data.core as any).configSystem && typeof (data.core as any).configSystem === 'object') {
             Object.assign(templates, (data.core as any).configSystem);
@@ -151,24 +280,90 @@ export default class Server {
         }
         const serverPath = `${BASE_SERVER_PATH}/${this.id}`;
         try { await fs.mkdir(serverPath, { recursive: true }); } catch {}
+        await this.ensureWritable(serverPath);
+        // Ajusta permissões dentro do FS do host via container auxiliar (root) antes de subir container final não-root
+        await this.fixPerms(data.image, serverPath);
         const writeTemplateFile = async (name: string, contentSpec: any) => {
             const filePath = `${serverPath}/${name}`;
             try {
-                let out = '';
-                if(typeof contentSpec === 'string') {
-                    out = replaceVars(contentSpec);
-                } else if(typeof contentSpec === 'object') {
-                    if(name.endsWith('.json')) {
-                        const jsonReplaced = JSON.parse(replaceVars(JSON.stringify(contentSpec)));
-                        out = JSON.stringify(jsonReplaced, null, 2);
-                    } else {
-                        out = Object.entries(contentSpec).map(([k,v])=>`${k}=${replaceVars(String(v))}`).join('\n');
-                    }
+                // 1) Se for string, comportamento antigo (substitui tudo)
+                if (typeof contentSpec === 'string') {
+                    const out = replaceVars(contentSpec);
+                    await fs.writeFile(filePath, out, 'utf8');
+                    this._emitLive('status', `Arquivo de config (overwrite) gerado: ${name}`);
+                    return;
                 }
-                await fs.writeFile(filePath, out, 'utf8');
-                this._emitLive('status', `Arquivo de config gerado: ${name}`);
+
+                // 2) Se for objeto JSON
+                if (name.endsWith('.json')) {
+                    let current: any = {};
+                    try {
+                        const existing = await fs.readFile(filePath, 'utf8');
+                        current = JSON.parse(existing);
+                    } catch {}
+                    // Faz replace de variáveis no objeto inteiro (stringify + replace + parse) para permitir variáveis em valores embutidos
+                    const jsonReplaced = JSON.parse(replaceVars(JSON.stringify(contentSpec)));
+                    // Merge superficial: atualiza / adiciona chaves informadas mantendo demais
+                    current = { ...current, ...jsonReplaced };
+                    await fs.writeFile(filePath, JSON.stringify(current, null, 2), 'utf8');
+                    this._emitLive('status', `Arquivo JSON mesclado: ${name}`);
+                    return;
+                }
+
+                // 3) Arquivo estilo propriedades (key=value). Atualiza somente as chaves fornecidas e preserva resto.
+                if (typeof contentSpec === 'object' && contentSpec) {
+                    const updates: Record<string,string> = {};
+                    for (const [k,v] of Object.entries(contentSpec)) {
+                        updates[k] = replaceVars(String(v));
+                    }
+
+                    let lines: string[] = [];
+                    try {
+                        const existing = await fs.readFile(filePath, 'utf8');
+                        // Preserva quebras originais
+                        lines = existing.split(/\r?\n/);
+                    } catch {
+                        lines = [];
+                    }
+
+                    // Mapeia chave -> índice da primeira ocorrência
+                    const keyLineIndex: Record<string, number> = {};
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        if (/^\s*[#;]/.test(line) || !/=/.test(line)) continue; // ignora comentários/linhas sem '='
+                        const match = line.match(/^\s*([^=\s]+)\s*=.*/);
+                        if (match) {
+                            const key = match[1];
+                            if (keyLineIndex[key] === undefined) keyLineIndex[key] = i; // primeira ocorrência
+                        }
+                    }
+
+                    for (const [key, value] of Object.entries(updates)) {
+                        if (keyLineIndex[key] !== undefined) {
+                            const idx = keyLineIndex[key];
+                            lines[idx] = `${key}=${value}`;
+                        } else {
+                            lines.push(`${key}=${value}`);
+                        }
+                    }
+
+                    // Remove linhas em branco duplicadas consecutivas (higiene leve)
+                    const cleaned: string[] = [];
+                    for (const l of lines) {
+                        if (l.trim() === '' && cleaned.length && cleaned[cleaned.length-1].trim() === '') continue;
+                        cleaned.push(l);
+                    }
+
+                    await fs.writeFile(filePath, cleaned.join('\n'), 'utf8');
+                    this._emitLive('status', `Arquivo properties atualizado: ${name}`);
+                    return;
+                }
+
+                // Fallback: serializa como antes
+                await fs.writeFile(filePath, replaceVars(String(contentSpec)), 'utf8');
+                this._emitLive('status', `Arquivo de config gerado (fallback): ${name}`);
             } catch(e:any) {
-                this._emitLive('error', `Falha ao gerar arquivo ${name}: ${e.message || e}`);
+                this._emitLive('error', `Falha ao gerar/mesclar arquivo ${name}: ${e.message || e}`);
             }
         };
         for(const fname of Object.keys(templates)) {
@@ -178,44 +373,57 @@ export default class Server {
         const envVars = Object.entries(data.environment).map(([key, value]) => `${key}=${String(value)}`);
 
         const portBindings: Docker.PortMap = {};
+        const exposedPorts:{ [p: string]: {} } = {}
         const allAllocations = [data.primaryAllocation, ...data.additionalAllocations];
         for (const alloc of allAllocations) {
             if (!alloc) continue;
+            exposedPorts[`${alloc.port}/tcp`] = {};
+            exposedPorts[`${alloc.port}/udp`] = {};
             const containerPortTCP = `${alloc.port}/tcp`;
             portBindings[containerPortTCP] = [{ HostIp: alloc.ip, HostPort: String(alloc.port) }];
             const containerPortUDP = `${alloc.port}/udp`;
             portBindings[containerPortUDP] = [{ HostIp: alloc.ip, HostPort: String(alloc.port) }];
         }
 
+        const hostConfig: Docker.HostConfig = {
+            Memory: data.memory * 1024 * 1024, // Docker treats 0 as unlimited
+            PortBindings: portBindings,
+            Binds: [`${BASE_SERVER_PATH}/${this.id}:/etc/enderd:rw`],
+            ReadonlyRootfs: true,
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges'],
+            LogConfig: {
+                Type: 'local',
+                Config: {
+                    compress: 'false',
+                    'max-file': '1',
+                    'max-size': '5m',
+                    mode: 'non-blocking'
+                }
+            },
+            Tmpfs: { '/tmp': 'rw,exec,nosuid,size=100M' }
+        };
+
+        if (data.cpu > 0) {
+            hostConfig.CpuPeriod = 100000;
+            hostConfig.CpuQuota = data.cpu * 1000;
+        }
+
         const containerOptions: Docker.ContainerCreateOptions = {
             Image: data.image,
             name: `${CONTAINER_NAME_PREFIX}${this.id}`,
             Env: envVars,
-            Cmd: ['/bin/sh', '-c', combinedCommand],
-            Tty: true,
-            OpenStdin: true,
+            ExposedPorts: exposedPorts,
+            Cmd: ['/bin/bash', '-c', combinedCommand],
             AttachStdin: true,
-            StdinOnce: false,
             AttachStdout: true,
             AttachStderr: true,
-            WorkingDir: '/home/hightd',
-            HostConfig: {
-                Memory: data.memory * 1024 * 1024,
-                CpuQuota: data.cpu * 1000,
-                CpuPeriod: 100000,
-                StorageOpt: { size: `${data.disk}M` },
-                PortBindings: portBindings,
-                Binds: [`${BASE_SERVER_PATH}/${this.id}:/home/hightd`],
-                LogConfig: {
-                    Type: 'json-file',
-                    Config: {
-                        compress: 'false',
-                        'max-file': '1',
-                        'max-size': '70k',
-                        mode: 'non-blocking'
-                    }
-                }
-            }
+            Tty: true,
+            OpenStdin: true,
+            StdinOnce: false,
+            WorkingDir: '/etc/enderd',
+            User: '65534:65534', // nobody
+            HostConfig: hostConfig
         };
 
         try {
@@ -331,6 +539,25 @@ export default class Server {
     async stop(data: StopData): Promise<void> {
         if (!this.container) return;
         this._emitLive('status', 'Parando servidor...');
+
+        // Comandos especiais
+        if (data.command === '^K') {
+            await this.kill();
+            return;
+        }
+        if (data.command === '^C') {
+            // Envia CTRL+C (SIGINT) para o processo principal.
+            try {
+                await this.container.kill({signal: 'SIGINT'});
+                return;
+            } catch (e:any) {
+                this._emitLive('error', 'Falha ao enviar ^C: ' + (e?.message||e) + ' -> aplicando kill.');
+                await this.kill();
+                return;
+            }
+        }
+
+        // Fluxo padrão: envia comando de parada graciosa
         try { await this.sendCommand({command: data.command}) } catch (e) {
             this._emitLive('error', 'Falha stop gracioso, aplicando kill.');
             await this.kill();
@@ -382,6 +609,7 @@ export default class Server {
         try { await fs.mkdir(serverPath, { recursive: true }); } catch (error) {
             throw new Error(`Falha ao criar o diretório para o servidor ${id} em ${serverPath}: ${error}`);
         }
+        try { await fs.chmod(serverPath, 0o777).catch(()=>{}); } catch {}
         Server.servers.push(new Server(id));
     }
 

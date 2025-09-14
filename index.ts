@@ -8,13 +8,38 @@ import config from "./config.json";
 import websocket from '@fastify/websocket';
 import {hasPermission} from './libs/RemoteConnect';
 import { startSFTP } from './libs/SFTP';
+import fsSync from 'fs';
+
+// Handlers globais para evitar crash do daemon
+process.on('unhandledRejection', (reason: any, promise) => {
+    console.error('[Daemon][unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err: any) => {
+    console.error('[Daemon][uncaughtException]', err);
+});
 
 async function main() {
     const orm = new SuperORM('database.sqlite');
     await orm.init(ServerModel);
 
+    const httpsPart: any = {};
+    if ((config as any).ssl) {
+        try {
+            const key = fsSync.readFileSync((config as any).keyPath);
+            const cert = fsSync.readFileSync((config as any).certPath);
+            httpsPart.https = { key, cert };
+            console.log('[HTTP] Iniciando em modo HTTPS');
+        } catch (e:any) {
+            console.error('[HTTP] Falha ao carregar certificados, fallback para HTTP:', e.message);
+        }
+    } else {
+        console.log('[HTTP] Iniciando em modo HTTP (ssl desativado)');
+    }
+
     const fastify = Fastify({
-        logger: false
+        logger: false,
+        bodyLimit: 100 * 1024 * 1024,
+        ...httpsPart
     })
 
     await fastify.register(require('@fastify/cors'), {
@@ -23,7 +48,7 @@ async function main() {
     await fastify.register(websocket);
 
     // Rota WebSocket deve vir ANTES da rota coringa '*'
-    const PREFIX_LABEL = 'container@hightd ~';
+    const PREFIX_LABEL = 'container@enderd ~';
     fastify.get('/api/v1/servers/console', { websocket: true }, (connection: any, req: any) => {
         const sock: any = (connection && connection.socket) ? connection.socket : connection;
         if(!sock || typeof sock.send !== 'function') {
@@ -41,14 +66,14 @@ async function main() {
         const colorForCategory = (category: string): string => {
             switch(category) {
                 case 'error': return '\x1b[31m';
-                case 'pull': return '\x1b[36m';
+                case 'pull': return '';
                 case 'status': return '';
                 case 'command': return '';
                 case 'warn': return '\x1b[33m';
                 default: return ''; // log / outros
             }
         };
-        const PREFIX_COLOR = '\x1b[36;1m'; // turquesa brilhante
+        const PREFIX_COLOR = '\x1b[38;2;148;2;247m'; // turquesa brilhante
         const RESET = '\x1b[0m';
         const buildColoredLine = (category: string, message: string): string => {
             if(category === 'log' || category === 'internal') {
@@ -225,14 +250,24 @@ async function main() {
         fastify.route({ method: m as any, url: '*', handler: universalHandler });
     }
 
-    try {
-        await fastify.listen({ port: config.port })
-        startSFTP(config.sftp);
-        await Server.start()
-    } catch (err) {
-        fastify.log.error(err)
-        process.exit(1)
-    }
+    // Função resiliente de inicialização
+    const startAll = async (attempt = 0) => {
+        try {
+            await fastify.listen({ port: config.port, host: "0.0.0.0" });
+            console.log(`[Daemon] HTTP ouvindo na porta ${config.port}`);
+            startSFTP(config.sftp);
+            console.log(`[Daemon] SFTP ouvindo na porta ${config.sftp}`);
+            await Server.start();
+            console.log('[Daemon] Inicialização completa.');
+        } catch (err: any) {
+            fastify.log.error(err);
+            const delay = Math.min(30000, 2000 * (attempt + 1));
+            console.error(`[Daemon] Falha ao iniciar (tentativa ${attempt + 1}): ${err?.message || err}. Retentando em ${delay}ms`);
+            setTimeout(() => startAll(attempt + 1), delay);
+        }
+    };
+
+    startAll();
 }
 
-main().catch(console.error);
+main().catch(e => console.error('[Daemon] Erro na função main:', e));

@@ -71,8 +71,8 @@ export function startSFTP(port: number) {
                 log('Rejeitado: username sem serverId. Formato esperado <user>_<serverId>');
                 return ctx.reject();
             }
-            usernameBase = parts[0];
-            const serverId = parts.slice(1).join('_'); // suporta underscores adicionais no ID
+            usernameBase = parts.slice(0, -1).join("_");
+            const serverId = parts.pop() || 'a'; // suporta underscores adicionais no ID
             // Nova lógica: tentar match exato e depois por prefixo
             serverObj = Server.getServer(serverId);
             if (!serverObj) {
@@ -159,9 +159,24 @@ export function startSFTP(port: number) {
                         log('REALPATH', givenPath);
                         try {
                             const full = normalize(givenPath);
+                            let st: fs.Stats | null = null;
+                            try { st = fs.statSync(full); } catch {}
                             const virt = toVirtual(full);
-                            sftpStream.name(reqid, [{ filename: virt, longname: virt, attrs: {} as any }]);
+                            const longname = st ? formatLongname(virt === '/' ? '.' : virt.slice(1), st) : virt;
+                            sftpStream.name(reqid, [{ filename: virt, longname, attrs: st ? statsToAttrs(st) : {} as any }]);
                         } catch (e:any) { log('REALPATH erro', e?.message||e); sftpStream.status(reqid, SFTP_CODE.FAILURE); }
+                    });
+
+                    // Novo: FSTAT para alguns clientes determinarem tipo corretamente
+                    // (FileZilla pode chamar em certos fluxos)
+                    sftpStream.on('FSTAT', async (reqid, handle) => {
+                        log('FSTAT');
+                        const h = fileHandles.get(handle.toString('hex'));
+                        if (!h) return sftpStream.status(reqid, SFTP_CODE.FAILURE);
+                        try {
+                            const st = await h.fd.stat();
+                            sftpStream.attrs(reqid, statsToAttrs(st));
+                        } catch (e:any) { log('FSTAT erro', e?.message||e); sftpStream.status(reqid, SFTP_CODE.FAILURE); }
                     });
 
                     sftpStream.on('STAT', async (reqid, givenPath) => {
@@ -201,7 +216,7 @@ export function startSFTP(port: number) {
                             try { st = fs.statSync(p); } catch {}
                             return {
                                 filename: ent.name,
-                                longname: ent.name,
+                                longname: st ? formatLongname(ent.name, st) : ent.name,
                                 attrs: st ? statsToAttrs(st) : {} as any
                             };
                         });
@@ -298,14 +313,32 @@ export function startSFTP(port: number) {
 // --- HELPERS ---
 function statsToAttrs(st: fs.Stats) {
     return {
-        mode: st.mode,
+        mode: st.mode, // inclui bits do tipo (S_IFDIR etc.)
         uid: (st as any).uid ?? 0,
         gid: (st as any).gid ?? 0,
         size: st.size,
-        atime: st.atimeMs / 1000,
-        mtime: st.mtimeMs / 1000,
-        ctime: st.ctimeMs / 1000
+        atime: Math.floor(st.atimeMs / 1000),
+        mtime: Math.floor(st.mtimeMs / 1000),
+        ctime: Math.floor(st.ctimeMs / 1000)
     } as any;
+}
+
+function formatLongname(name: string, st: fs.Stats): string {
+    // tipo
+    let typeChar = '-';
+    if (st.isDirectory()) typeChar = 'd';
+    else if (st.isSymbolicLink()) typeChar = 'l';
+    // permissões básicas (se não quiser granular, usa 755 p/ dir, 644 p/ file)
+    const perm = st.isDirectory() ? 'rwxr-xr-x' : 'rw-r--r--';
+    const nlink = 1;
+    const owner = 'owner';
+    const group = 'group';
+    const size = st.size.toString().padStart(6, ' ');
+    const d = new Date(st.mtimeMs);
+    const month = d.toLocaleString('en-US', { month: 'short' });
+    const day = d.getDate().toString().padStart(2, ' ');
+    const timeOrYear = d.getFullYear().toString();
+    return `${typeChar}${perm} ${nlink} ${owner} ${group} ${size} ${month} ${day} ${timeOrYear} ${name}`;
 }
 
 function flagsToFsFlags(flags: number): string {

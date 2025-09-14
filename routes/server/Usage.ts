@@ -37,6 +37,9 @@ export default async function GetServerUsage(request: FastifyRequest, reply: Fas
             memory: usage.memory,
             memoryLimit: usage.memoryLimit,
             memoryPercent,
+            networkIn: usage.networkIn,
+            networkOut: usage.networkOut,
+            disk: usage.disk,
             startedAt: server.getStartedAt(),
             uptimeMs: server.getUptimeMs(),
             state: await server.getStatus()
