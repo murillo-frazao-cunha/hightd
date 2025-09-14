@@ -73,6 +73,7 @@ export default class Server {
      */
     async sendCommand(input: string | { command: string }): Promise<void> {
         if (!this.container) return;
+    
         this.container.attach({
             stream: true,
             stdin: true,
@@ -84,30 +85,7 @@ export default class Server {
                 return;
             }
 
-            // O write deve ser feito em um ponto que garanta a conexão
-            // completa, como após um evento 'ready' ou 'connect'.
-            // Algumas bibliotecas de cliente para Docker já fazem isso
-            // implicitamente, mas o ideal é que você se certifique.
-
-            // A forma mais direta é chamar o write logo após,
-            // mas se o problema persistir, a causa é assíncrona.
-
-            // A maneira correta seria:
-            // 1. Você precisa garantir que a stream é a de input (stdin).
-            // 2. Você tem que se certificar de que ela está pronta para receber dados.
-
-            // Exemplo de como poderia ser:
-            // Se a stream é um HttpDuplex, ela é tanto lida quanto escrita
-            stream.on('connect', () => {
-                stream.write(`${input}\n`, (writeErr) => {
-                    if (writeErr) {
-                        console.error("Erro ao escrever na stream:", writeErr);
-                    } else {
-                        console.log("Comando enviado com sucesso 1.");
-                    }
-                });
-            });
-
+            
             // Se o seu stream não tiver o evento 'connect', a solução
             // mais simples pode ser adicionar um pequeno delay com 'setTimeout'.
             // Mas, essa é uma solução temporária, não a ideal.
@@ -119,6 +97,7 @@ export default class Server {
                     console.error("Erro ao escrever na stream:", err);
                 } else {
                     console.log("Comando enviado com sucesso 2.");
+                    stream.end(); // Encerra a stream após enviar o comando
                 }
             });
         });
@@ -558,7 +537,7 @@ export default class Server {
         }
 
         // Fluxo padrão: envia comando de parada graciosa
-        try { await this.sendCommand({command: data.command}) } catch (e) {
+        try { await this.sendCommand(data.command) } catch (e) {
             this._emitLive('error', 'Falha stop gracioso, aplicando kill.');
             await this.kill();
         }

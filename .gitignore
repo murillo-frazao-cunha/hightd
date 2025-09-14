@@ -1,2 +1,9 @@
 # Project exclude paths
-/node_modules/pino/test/transport/core.test.js
+node_modules/
+config.json
+database.sqlite
+.env
+dist/
+build/
+*.log
+*.sqlite3
