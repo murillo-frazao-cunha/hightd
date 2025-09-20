@@ -1,7 +1,7 @@
 import { ServerModel } from "../database/model/ServerModel";
 import Docker from 'dockerode';
 import { CoreData, AllocationData, StartData, StopData } from "../types/ServerTypes";
-import fs from 'fs/promises'; // Adicionado para manipulação de arquivos
+import fs from 'fs/promises';
 import { PassThrough } from 'stream';
 import path from 'path';
 
@@ -18,17 +18,17 @@ async function getDirectorySize(dir: string): Promise<number> {
                 const { size } = await fs.stat(filePath);
                 return size;
             } catch {
-                return 0; // Ignore files we can't stat
+                return 0;
             }
         }));
         return sizes.reduce((acc, size) => acc + size, 0);
     } catch {
-        return 0; // If we can't read the directory, size is 0
+        return 0;
     }
 }
 // --- Classe Principal de Gerenciamento do Servidor ---
 const docker = new Docker();
-const CONTAINER_NAME_PREFIX = 'ptero-clone-';
+const CONTAINER_NAME_PREFIX = '';
 import config from "../config.json"
 export const BASE_SERVER_PATH = config.path;
 
@@ -41,11 +41,11 @@ export default class Server {
             this.container.remove({ force: true }).catch(() => { });
             this.container = null;
         }
-        this.running = false;
-        this.isInitializing = false;
+        this.status = "stopped";
         this.startedAt = null;
         this.stdinStream = null;
         this.liveListeners.clear();
+        this._stopUsageMonitor();
         const serverPath = `${BASE_SERVER_PATH}/${this.id}`;
         fs.rm(serverPath, { recursive: true, force: true }).catch(() => { });
         const index = Server.servers.indexOf(this);
@@ -58,11 +58,15 @@ export default class Server {
 
     id: string;
     container: Docker.Container | null = null;
-    running: boolean = false;
-    private isInitializing: boolean = false;
+    private status: "stopped" | "initializing" | "running" = "stopped";
     private startedAt: number | null = null;
     private stdinStream: any | null = null;
     private liveListeners: Set<(entry: { category: string; message: string; timestamp: number }) => void> = new Set();
+
+    // --- NOVAS PROPRIEDADES ---
+    private usageCache: { cpu: number; memory: number; memoryLimit: number; disk: number; networkIn: number; networkOut: number; } | null = null;
+    private isMonitoring: boolean = false;
+    private monitorInterval: NodeJS.Timeout | null = null;
 
     constructor(id: string) {
         this.id = id;
@@ -73,7 +77,6 @@ export default class Server {
      */
     async sendCommand(input: string | { command: string }): Promise<void> {
         if (!this.container) return;
-    
         this.container.attach({
             stream: true,
             stdin: true,
@@ -85,7 +88,30 @@ export default class Server {
                 return;
             }
 
-            
+            // O write deve ser feito em um ponto que garanta a conexão
+            // completa, como após um evento 'ready' ou 'connect'.
+            // Algumas bibliotecas de cliente para Docker já fazem isso
+            // implicitamente, mas o ideal é que você se certifique.
+
+            // A forma mais direta é chamar o write logo após,
+            // mas se o problema persistir, a causa é assíncrona.
+
+            // A maneira correta seria:
+            // 1. Você precisa garantir que a stream é a de input (stdin).
+            // 2. Você tem que se certificar de que ela está pronta para receber dados.
+
+            // Exemplo de como poderia ser:
+            // Se a stream é um HttpDuplex, ela é tanto lida quanto escrita
+            stream.on('connect', () => {
+                stream.write(`${input}\n`, (writeErr) => {
+                    if (writeErr) {
+                        console.error("Erro ao escrever na stream:", writeErr);
+                    } else {
+                        console.log("Comando enviado com sucesso 1.");
+                    }
+                });
+            });
+
             // Se o seu stream não tiver o evento 'connect', a solução
             // mais simples pode ser adicionar um pequeno delay com 'setTimeout'.
             // Mas, essa é uma solução temporária, não a ideal.
@@ -97,7 +123,6 @@ export default class Server {
                     console.error("Erro ao escrever na stream:", err);
                 } else {
                     console.log("Comando enviado com sucesso 2.");
-                    stream.end(); // Encerra a stream após enviar o comando
                 }
             });
         });
@@ -107,15 +132,31 @@ export default class Server {
      * Puxa as estatísticas de uso de CPU, RAM, disco e rede do container.
      */
     async getUsages(): Promise<{ cpu: number; memory: number; memoryLimit: number; disk: number; networkIn: number; networkOut: number; }> {
-        const serverPath = `${BASE_SERVER_PATH}/${this.id}`;
-        const diskUsagePromise = getDirectorySize(serverPath);
+        // Retorna o cache se disponível e se o servidor estiver rodando
+        if (this.status === 'running' && this.usageCache) {
+            return this.usageCache;
+        } else {
+            if(this.status === 'initializing' && this.container && this.usageCache) {
+                return this.usageCache;
+            }
 
-        if (await this.getStatus() === 'stopped' || !this.container) {
-            const disk = await diskUsagePromise;
-            return { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
+        }
+
+        const disk = await getDirectorySize(`${BASE_SERVER_PATH}/${this.id}`).catch(() => 0);
+
+        return { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
+    }
+
+    private async _updateUsageCache(): Promise<void> {
+        if (!this.container || (this.status !== 'running') && this.status !== 'initializing') {
+            this.usageCache = { cpu: 0, memory: 0, memoryLimit: 0, disk: 0, networkIn: 0, networkOut: 0 };
+            return;
         }
 
         try {
+            const serverPath = `${BASE_SERVER_PATH}/${this.id}`;
+            const diskUsagePromise = getDirectorySize(serverPath);
+
             const [stats, disk] = await Promise.all([
                 this.container.stats({ stream: false }),
                 diskUsagePromise
@@ -142,18 +183,11 @@ export default class Server {
                 cpuUsage = (cpuDelta / systemCpuDelta) * numberOfCpus * 100.0;
             }
             const cpu = parseFloat(cpuUsage.toFixed(2));
-
-            return {
-                cpu,
-                memory: memoryUsage,
-                memoryLimit: memoryLimit,
-                disk,
-                networkIn,
-                networkOut,
-            };
+            const newUsages = { cpu, memory: memoryUsage, memoryLimit: memoryLimit, disk, networkIn, networkOut };
+            this.usageCache = newUsages;
         } catch (e) {
-            const disk = await diskUsagePromise.catch(() => 0);
-            return { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
+            const disk = await getDirectorySize(`${BASE_SERVER_PATH}/${this.id}`).catch(() => 0);
+            this.usageCache = { cpu: 0, memory: 0, memoryLimit: 0, disk, networkIn: 0, networkOut: 0 };
         }
     }
 
@@ -217,11 +251,11 @@ export default class Server {
             try { await this.container.remove({ force: true }); } catch { } finally { this.container = null; }
         }
 
-        // Estado inicial: sem mais 'initializing'; só definimos running=false até confirmação.
+        // Define o estado para "initializing" no início do processo.
+        this.status = "initializing";
+        this._emitLive('status', 'Servidor marcado como iniciando.');
         this.startedAt = null;
-        this.running = false;
-        this.isInitializing = false;
-        this._emitLive('status', 'Iniciando servidor...');
+        this._emitLive('internal', 'initializing');
 
         // --- Substituição de variáveis ---
         const primaryPort = data.primaryAllocation?.port;
@@ -390,7 +424,7 @@ export default class Server {
 
         const containerOptions: Docker.ContainerCreateOptions = {
             Image: data.image,
-            name: `${CONTAINER_NAME_PREFIX}${this.id}`,
+            name: `${this.id}`,
             Env: envVars,
             ExposedPorts: exposedPorts,
             Cmd: ['/bin/bash', '-c', combinedCommand],
@@ -416,12 +450,12 @@ export default class Server {
                         if(event?.status) {
                             const ref = event.id ? `${event.id}: ${event.status}` : event.status;
                             const prog = event.progress ? ` ${event.progress}` : '';
-                            this._emitLive('pull', `${ref}${prog}`);
+                            this._emitLive('log', `${ref}${prog}`);
                         }
                     } catch {}
                 });
             });
-            this._emitLive('pull', 'Pull concluído');
+            this._emitLive('pull', 'Pulling de imagem concluída');
             const newContainer = await docker.createContainer(containerOptions);
             this.container = newContainer;
             console.log(`[Server:${this.id}] Container criado. Iniciando...`);
@@ -429,58 +463,62 @@ export default class Server {
 
             await this.container.start();
 
-            // Confirma estado running no Docker
-            let isRunning = false;
-            for (let i = 0; i < 15; i++) {
-                try {
-                    if(!this.container) break;
-                    const inspectData = await this.container.inspect();
-                    if (inspectData.State.Status === 'running') { isRunning = true; break; }
-                } catch {}
-                await new Promise(r => setTimeout(r, 200));
-            }
-            if (!isRunning) {
-                this._emitLive('error', 'Timeout para container ficar running.');
-            } else {
-                this.running = true;
-                this.startedAt = Date.now();
-                this._emitLive('status', 'Servidor em execução.');
-            }
-
+            // A lógica de transição para "running" foi movida para o _attachAfterStart
             this._emitLive('internal', 'container_started');
             console.log(`[Server:${this.id}] Container iniciado. Fazendo attach...`);
             this._emitLive('status', 'Container iniciado, anexando...');
             await this._attachAfterStart(doneString || '');
             console.log(`[Server:${this.id}] Server start finalizado.`);
+            this._startUsageMonitor();
+            this._waitContainerExit();
         } catch (error) {
             console.error(`[Server:${this.id}] Erro start:`, error);
             this._emitLive('error', `Falha ao iniciar: ${(error as any)?.message || error}`);
             if(this.container) { try { await this.container.remove({ force: true }); } catch {} }
             this.container = null;
-            this.running = false;
-            this.isInitializing = false;
+            this.status = "stopped";
             this.startedAt = null;
             this.stdinStream = null;
+            this._stopUsageMonitor(); // GARANTIR QUE PARE O MONITORAMENTO
             throw error;
         }
     }
 
     /**
-     * Anexa ao container (sem lógica de transição de estado agora).
+     * Anexa ao container e espera pela string de "pronto" (doneString).
      */
-    private async _attachAfterStart(_doneString: string): Promise<void> {
+    private async _attachAfterStart(doneString: string): Promise<void> {
         if (!this.container) return;
         const stream: any = await this.container.attach({ stream: true, stdin: true, stdout: true, stderr: true });
         this.stdinStream = stream;
         (this.container as any).stdin = stream;
-        this.container.wait().then(() => {
-            this.running = false;
-            this.startedAt = null;
-            this.stdinStream = null;
-            this._emitLive('status', 'Servidor marcado como desligado.');
-        }).catch(() => {});
-        // Apenas repassa dados de saída como antes
-        stream.on('data', (_chunk: Buffer) => { /* saída tratada nos listeners de logs/WebSocket */ });
+
+        // Listener para transição de estado.
+        const logStream: any = await this.container.logs({
+            follow: true,
+            stdout: true,
+            stderr: true,
+            tail: 0
+        });
+
+        const doneListener = (chunk: Buffer) => {
+            const line = chunk.toString('utf8').trim();
+            this._emitLive('log', line);
+            if (doneString && line.includes(doneString)) {
+                this.status = 'running';
+                this.startedAt = Date.now();
+                this._emitLive('status', 'Servidor marcado como iniciado.');
+            }
+        };
+
+        logStream.on('data', doneListener);
+        logStream.on('error', () => { (logStream as any).destroy(); });
+        logStream.on('end', () => { (logStream as any).destroy(); });
+
+        this.actionsToDoWhenStop.push(() => {
+            (logStream as any).destroy();
+        })
+
     }
 
     private async _reattach(): Promise<void> {
@@ -497,10 +535,11 @@ export default class Server {
      */
     async restart(data: StartData): Promise<void> {
         if (this.container) {
-            this._emitLive('status', 'Reiniciando servidor...');
             await this.stop({ command: data.core.stopCommand });
         }
-        await this.start(data);
+        this.actionsToDoWhenStop.push(async () => {
+            await this.start(data);
+        })
     }
 
     /**
@@ -510,14 +549,18 @@ export default class Server {
         if (!this.container) return;
         this._emitLive('status', 'Forçando parada (kill)...');
         try { await this.container.kill(); } catch { }
+        this.status = "stopped";
+        this._stopUsageMonitor();
     }
+
+
+
 
     /**
      * Para o container de forma "graciosa".
      */
     async stop(data: StopData): Promise<void> {
         if (!this.container) return;
-        this._emitLive('status', 'Parando servidor...');
 
         // Comandos especiais
         if (data.command === '^K') {
@@ -535,7 +578,6 @@ export default class Server {
                 return;
             }
         }
-
         // Fluxo padrão: envia comando de parada graciosa
         try { await this.sendCommand(data.command) } catch (e) {
             this._emitLive('error', 'Falha stop gracioso, aplicando kill.');
@@ -543,39 +585,58 @@ export default class Server {
         }
     }
 
+
+    actionsToDoWhenStop: any[] = [];
+
+    _waitContainerExit(): void {
+        if(this.container) {
+            this.container.wait().then(async () => {
+                this.status = 'stopped';
+                this.startedAt = null;
+                this.stdinStream = null;
+                this._stopUsageMonitor();
+                this._emitLive('status', 'Servidor marcado como desligado.');
+                for (const action of this.actionsToDoWhenStop) {
+                    action()
+                }
+                this.actionsToDoWhenStop = [];
+            }).catch(() => {});
+        }
+    }
+
     /**
      * Retorna o estado atual do servidor (apenas 'running' ou 'stopped').
      */
-    async getStatus(): Promise<"running" | "stopped"> {
-        if (!this.container) {
-            this.running = false;
-            return "stopped";
-        }
-        try {
-            const inspectData = await this.container.inspect();
-            const status = inspectData.State.Status;
-            if (status === 'running') {
-                if (!this.running) {
-                    // sincroniza caso reinício do painel
-                    this.running = true;
-                    if(!this.startedAt && inspectData.State?.StartedAt) {
-                        const startedDate = new Date(inspectData.State.StartedAt).getTime();
-                        this.startedAt = !isNaN(startedDate) ? startedDate : Date.now();
-                    }
-                }
-                return 'running';
-            }
-            this.running = false;
-            return 'stopped';
-        } catch {
-            this.running = false;
-            this.container = null;
-            return 'stopped';
-        }
+    async getStatus(): Promise<"stopped" | "initializing" | "running"> {
+        return this.status;
     }
 
     getStartedAt(): number | null { return this.startedAt; }
     getUptimeMs(): number { return this.startedAt ? Date.now() - this.startedAt : 0; }
+
+    // --- NOVOS MÉTODOS DE MONITORAMENTO ---
+    private _startUsageMonitor() {
+        if (this.isMonitoring) return;
+        this.isMonitoring = true;
+        // Run once immediately to get initial values
+        this._updateUsageCache().catch(e => console.error(`[Server:${this.id}] Falha na atualização inicial:`, e));
+        this.monitorInterval = setInterval(async () => {
+            await this._updateUsageCache().catch(e => {
+                console.error(`[Server:${this.id}] Falha ao monitorar uso:`, e);
+            });
+        }, 700); // 700ms = 0.7 segundos
+
+    }
+
+    private _stopUsageMonitor() {
+        if (!this.isMonitoring) return;
+        if (this.monitorInterval) {
+            clearInterval(this.monitorInterval);
+        }
+        this.isMonitoring = false;
+        this.monitorInterval = null;
+        this.usageCache = null; // Limpa o cache ao parar
+    }
 
     // --- Métodos e Propriedades Estáticas ---
     static servers: Server[] = [];
@@ -611,7 +672,7 @@ export default class Server {
             if (existingContainer) {
                 server.container = docker.getContainer(existingContainer.Id);
                 if (existingContainer.State === 'running') {
-                    server.running = true;
+                    server.status = 'running';
                     try {
                         const inspect = await server.container.inspect();
                         if (inspect?.State?.StartedAt) {
@@ -622,6 +683,11 @@ export default class Server {
                         }
                     } catch { server.startedAt = Date.now(); }
                     await server._reattach();
+                    await server._waitContainerExit();
+                    server._startUsageMonitor(); // INICIA MONITORAMENTO NO ARRANQUE DO PAINEL
+                } else if (existingContainer.State === 'created' || existingContainer.State === 'restarting') {
+                    // Trata containers que foram criados, mas não estão rodando
+                    server.status = 'stopped'; // Reinicializar como "parado"
                 }
             }
 
@@ -652,7 +718,7 @@ export default class Server {
         let closed = false;
         const cleanup = () => {
             if(closed) return; closed = true;
-            try { logStream.destroy(); } catch {}
+            try { (logStream as any).destroy(); } catch {}
             try { stdout?.destroy?.(); } catch {}
             try { stderr?.destroy?.(); } catch {}
         };

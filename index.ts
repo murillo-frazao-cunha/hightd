@@ -38,7 +38,7 @@ async function main() {
 
     const fastify = Fastify({
         logger: false,
-        bodyLimit: 100 * 1024 * 1024,
+        bodyLimit: 2 * 1024 * 1024 * 1024,
         ...httpsPart
     })
 
@@ -191,10 +191,6 @@ async function main() {
                                 streamStarted = false;
                             }
                         } else { // running
-                            if (!streamStarted) {
-                                log('monitor', 'Servidor iniciou, tentando conectar stream.');
-                                await beginStream(server, tail);
-                            }
                         }
                         lastStatus = currentStatus;
                     }
@@ -242,6 +238,112 @@ async function main() {
         }
     });
 
+    // Rota WebSocket para usages (envia métricas a cada 1s)
+    fastify.get('/api/v1/servers/usages', { websocket: true }, (connection: any, req: any) => {
+        const sock: any = (connection && connection.socket) ? connection.socket : connection;
+        if(!sock || typeof sock.send !== 'function') {
+            console.error('[WS][usages] Socket inválido');
+            return;
+        }
+        const startedAt = Date.now();
+        let serverId: string | undefined;
+        let userUuid: string | undefined;
+        let usageTimer: NodeJS.Timeout | null = null;
+        let hb: NodeJS.Timeout | null = null;
+
+        const safeSend = (obj: any) => { try { sock.send(JSON.stringify(obj)); } catch {} };
+        const sendError = (msg: string) => safeSend({ type: 'error', message: msg });
+        const log = (phase: string, msg: string, extra?: any) => {
+            const meta = `[WS][usages][${phase}]` + (serverId?`[server=${serverId}]`:'') + (userUuid?`[user=${userUuid}]`:'');
+            if(extra!==undefined) console.log(meta, msg, extra); else console.log(meta, msg);
+        };
+
+        const cleanup = () => {
+            if(usageTimer) clearInterval(usageTimer);
+            if(hb) clearInterval(hb);
+            usageTimer = null; hb = null;
+        };
+
+        try {
+            const q = req.query as any;
+            serverId = q?.serverId;
+            userUuid = q?.userUuid;
+            if(!serverId || !userUuid) {
+                sendError('Parâmetros ausentes');
+                return sock.close();
+            }
+            const server = Server.getServer(serverId);
+            if(!server) {
+                sendError('Servidor não encontrado');
+                return sock.close();
+            }
+            hasPermission(userUuid, server).then(async perm => {
+                if(!perm) {
+                    sendError('Sem permissão');
+                    return sock.close();
+                }
+                log('init','Conexão de usages estabelecida');
+
+                // Envia imediatamente uma leitura inicial
+                const pushUsage = async () => {
+                    try {
+                        const date = Date.now()
+                        const usage = await server.getUsages();
+                        const memoryPercent = usage.memoryLimit > 0 ? (usage.memory / usage.memoryLimit) * 100 : 0;
+                        const state = await server.getStatus();
+                        safeSend({
+                            type: 'usage',
+                            timestamp: Date.now(),
+                            usage: {
+                                cpu: usage.cpu,
+                                memory: usage.memory,
+                                memoryLimit: usage.memoryLimit,
+                                memoryPercent,
+                                networkIn: usage.networkIn,
+                                networkOut: usage.networkOut,
+                                disk: usage.disk,
+                                startedAt: server.getStartedAt(),
+                                uptimeMs: server.getUptimeMs(),
+                                state
+                            }
+                        });
+
+                    } catch(e:any) {
+                        sendError('Falha ao coletar métricas: ' + (e?.message || e));
+                    }
+                };
+                console.log('enviando')
+                pushUsage();
+                pushUsage();
+                usageTimer = setInterval(pushUsage, 1000);
+
+                // Heartbeat simples reutilizando ping/pong
+                let alive = true; sock.on?.('pong',()=> alive = true);
+                hb = setInterval(()=>{
+                    if(!alive) {
+                        cleanup();
+                        try { sock.terminate?.(); } catch {};
+                        return;
+                    }
+                    alive = false; try { sock.ping?.(); } catch {};
+                },15000);
+
+                sock.on('close', () => {
+                    cleanup();
+                    log('close','Conexão encerrada.', { durMs: Date.now()-startedAt });
+                });
+                sock.on('error', (er:any) => log('socket-error','erro', er?.message||er));
+            }).catch(e => {
+                log('perm-error','falha perm', e);
+                sendError('Falha na verificação de permissão');
+                sock.close();
+            });
+        } catch(e:any) {
+            log('fatal','exceção no setup', e?.message||e);
+            sendError('Erro interno no servidor de usages');
+            sock.close();
+        }
+    });
     const universalHandler = async (request: any, reply: any) => {
         return handleRequest(request, reply);
     };

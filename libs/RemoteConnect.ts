@@ -1,9 +1,14 @@
 import axios from "axios";
 import config from '../config.json';
 import Server from "./Server"
+import * as https from "node:https";
 
 const API_BASE_URL = config.remote + '/api/nodes/helper';
-const api = axios.create({ baseURL: API_BASE_URL });
+//como ignorar sel-signed certificate
+
+const api = axios.create({ baseURL: API_BASE_URL,   httpsAgent: new https.Agent({
+        rejectUnauthorized: false
+    }) });
 
 
 export async function VerifySFTP(userName: string, password: string, server: Server) {

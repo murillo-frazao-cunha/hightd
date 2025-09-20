@@ -389,6 +389,7 @@ async function handleUnarchive(body: any, reply: FastifyReply) {
             }
         }
     } catch(e:any) {
+        console.error(e)
         return reply.code(500).send({ error: 'Falha ao descompactar', detail: e.message });
     }
 
