@@ -111,7 +111,6 @@ async function main() {
   }
 
   await fs.writeFile(configPath, JSON.stringify(newConfig, null, 2) + '\n', 'utf8');
-  console.log('config.json atualizado:', newConfig);
   console.log('Concluído.');
 }
 
